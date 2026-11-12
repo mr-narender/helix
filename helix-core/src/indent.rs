@@ -805,6 +805,8 @@ fn candidate_body_for_new_line<'a>(
 /// Prepare an indent query by computing:
 /// - The node from which to start the query (this is non-trivial due to `@extend` captures)
 /// - The indent captures for all relevant nodes.
+/// - The ranges of `@opaque` nodes.
+/// - Whether the node was extended past its end and isn't closed by a delimiter.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 fn init_indent_query<'a, 'b>(
@@ -895,47 +897,22 @@ fn init_indent_query<'a, 'b>(
             );
         }
     }
-    Some((node, query_result.indent_captures, opaque_ranges, extended))
+    let delimited = {
+        let mut children = node.children().filter(|child| !is_trivia(child));
+        match (children.next(), children.last()) {
+            (Some(first), Some(last)) => !first.is_named() && !last.is_named(),
+            _ => false,
+        }
+    };
+    let open_ended = extended && !delimited;
+    Some((
+        node,
+        query_result.indent_captures,
+        opaque_ranges,
+        open_ended,
+    ))
 }
 
-/// Use the syntax tree to determine the indentation for a given position.
-/// This can be used in 2 ways:
-///
-/// - To get the correct indentation for an existing line (new_line=false), not necessarily equal to the current indentation.
-///   - In this case, pos should be inside the first tree-sitter node on that line.
-///     In most cases, this can just be the first non-whitespace on that line.
-///   - To get the indentation for a new line (new_line=true). This behaves like the first usecase if the part of the current line
-///     after pos were moved to a new line.
-///
-/// The indentation is determined by traversing all the tree-sitter nodes containing the position.
-/// Each of these nodes produces some [Indentation] for:
-///
-/// - The line of the (beginning of the) node. This is defined by the scope `all` if this is the first node on its line.
-/// - The line after the node. This is defined by:
-///   - The scope `tail`.
-///   - The scope `all` if this node is not the first node on its line.
-///
-/// Intuitively, `all` applies to everything contained in this node while `tail` applies to everything except for the first line of the node.
-/// The indents from different nodes for the same line are then combined.
-/// The result [Indentation] is simply the sum of the [Indentation] for all lines.
-///
-/// Specifying which line exactly an [Indentation] applies to is important because indents on the same line combine differently than indents on different lines:
-/// ```ignore
-/// some_function(|| {
-///     // Both the function parameters as well as the contained block should be indented.
-///     // Because they are on the same line, this only yields one indent level
-/// });
-/// ```
-///
-/// ```ignore
-/// some_function(
-///     param1,
-///     || {
-///         // Here we get 2 indent levels because the 'parameters' and the 'block' node begin on different lines
-///     },
-/// );
-/// ```
-#[allow(clippy::too_many_arguments)]
 /// Whether `byte_pos` falls in the interior of an `@opaque` node spanning
 /// `[start, end)` that began on an *earlier* line — i.e. a string / heredoc /
 /// block-comment body whose leading whitespace is literal content. Shared by the
@@ -961,32 +938,21 @@ pub fn is_opaque_interior(
     text: RopeSlice,
     byte_pos: u32,
 ) -> bool {
-    let Some(opaque) = query.opaque_capture else {
-        return false;
-    };
-    let mut cursor = InactiveQueryCursor::new(byte_pos..byte_pos + 1, TREE_SITTER_MATCH_LIMIT)
-        .execute_query(
-            &query.query,
-            &syntax.tree_for_byte_range(byte_pos, byte_pos).root_node(),
-            RopeInput::new(text),
-        );
-    while let Some(m) = cursor.next_match() {
-        for matched in m.matched_nodes() {
-            if matched.capture == opaque
-                && opaque_hit(
-                    matched.node.start_byte(),
-                    matched.node.end_byte(),
-                    byte_pos,
-                    text,
-                )
-            {
-                return true;
-            }
-        }
-    }
-    false
+    let root = syntax.tree_for_byte_range(byte_pos, byte_pos).root_node();
+    query_indents(query, &root, text, byte_pos..byte_pos + 1, None)
+        .opaque_ranges
+        .iter()
+        .any(|range| opaque_hit(range.start, range.end, byte_pos, text))
 }
 
+/// Use the syntax tree to determine the indentation for a given position.
+/// This can be used in 2 ways:
+///
+/// - To get the correct indentation for an existing line (new_line=false), not necessarily equal to the current indentation.
+///   - In this case, pos should be inside the first tree-sitter node on that line.
+///     In most cases, this can just be the first non-whitespace on that line.
+/// - To get the indentation for a new line (new_line=true). This behaves like the first usecase if the part of the current line
+///   after pos were moved to a new line.
 #[allow(clippy::too_many_arguments)]
 pub fn treesitter_indent_for_pos<'a>(
     query: &IndentQuery,
@@ -999,7 +965,10 @@ pub fn treesitter_indent_for_pos<'a>(
     pos: usize,
     new_line: bool,
 ) -> Option<Indentation<'a>> {
-    let byte_pos = text.char_to_byte(pos) as u32;
+    let mut byte_pos = text.char_to_byte(pos) as u32;
+    if new_line && text.get_byte(byte_pos as usize) == Some(b'\r') {
+        byte_pos += 1;
+    }
     // Inside an injection layer indent with that language's query and tree,
     // then shift the whole result by the injection's base indent.
     let layer = syntax.layer_for_byte_range(byte_pos, byte_pos);
@@ -1051,6 +1020,45 @@ pub fn treesitter_indent_for_pos<'a>(
     Some(result)
 }
 
+/// Re-indents every non-blank line of `text` according to the indent query. Lines the query
+/// has no indentation for are left as they are.
+pub fn treesitter_format_changes(
+    query: &IndentQuery,
+    syntax: &Syntax,
+    loader: &syntax::Loader,
+    indent_style: &IndentStyle,
+    tab_width: usize,
+    text: RopeSlice,
+) -> Vec<crate::transaction::Change> {
+    let indent_width = indent_style.indent_width(tab_width);
+    let mut changes = Vec::new();
+    let mut line_start = 0;
+    for (line_idx, line) in text.lines().enumerate() {
+        if let Some(first_non_ws) = line.first_non_whitespace_char() {
+            let pos = line_start + first_non_ws;
+            let indent = treesitter_indent_for_pos(
+                query,
+                syntax,
+                loader,
+                tab_width,
+                indent_width,
+                text,
+                line_idx,
+                pos,
+                false,
+            );
+            if let Some(indent) = indent {
+                let indent = indent.to_string(indent_style, tab_width);
+                if line.slice(..first_non_ws) != indent.as_str() {
+                    changes.push((line_start, pos, Some(indent.into())));
+                }
+            }
+        }
+        line_start += line.len_chars();
+    }
+    changes
+}
+
 /// Compute indentation by *scope containment*.
 ///
 /// Each node carrying an `@indent`/`@indent.always` capture defines a scope
@@ -1073,7 +1081,7 @@ fn containment_accounting<'a>(
     // Reuse the standard setup: this applies @extend repositioning / body-descent
     // and returns the per-node capture map (all ancestors of the cursor intersect
     // the query range, so their captures are present).
-    let (start_node, captures, opaque_ranges, extended) = init_indent_query(
+    let (start_node, captures, opaque_ranges, open_ended) = init_indent_query(
         query,
         root,
         text,
@@ -1134,7 +1142,7 @@ fn containment_accounting<'a>(
 
             let node_start = get_node_start_line(text, &node, new_line_byte_pos);
             let mut end = get_node_end_line(text, &node, new_line_byte_pos);
-            if extended && new_line {
+            if open_ended && new_line {
                 end = end.max(target_line);
             }
             // `scope "header"` (set by the query on a brace-less body rule such as
